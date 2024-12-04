@@ -14,6 +14,7 @@ use bitcoin::OutPoint;
 use bitvec::array::BitArray;
 use clarity::codec::StacksMessageCodec as _;
 use clarity::vm::types::PrincipalData;
+use hashbrown::HashMap;
 use p256k1::point::Point;
 use p256k1::scalar::Scalar;
 use polynomial::Polynomial;
@@ -649,21 +650,36 @@ impl From<proto::DkgBegin> for DkgBegin {
 
 impl From<DkgPrivateBegin> for proto::DkgPrivateBegin {
     fn from(value: DkgPrivateBegin) -> Self {
+        let shares = value
+            .dkg_public_shares
+            .iter()
+            .map(|(i, s)| (*i, proto::SignerDkgPublicShares::from(s.clone())))
+            .collect();
+        let dkg_public_shares = Some(proto::DkgPublicShares { shares });
         proto::DkgPrivateBegin {
             dkg_id: value.dkg_id,
             signer_ids: value.signer_ids,
             key_ids: value.key_ids,
+            dkg_public_shares,
         }
     }
 }
 
-impl From<proto::DkgPrivateBegin> for DkgPrivateBegin {
-    fn from(value: proto::DkgPrivateBegin) -> Self {
-        DkgPrivateBegin {
+impl TryFrom<proto::DkgPrivateBegin> for DkgPrivateBegin {
+    type Error = Error;
+    fn try_from(value: proto::DkgPrivateBegin) -> Result<Self, Self::Error> {
+        let mut dkg_public_shares = HashMap::new();
+        if let Some(shares) = value.dkg_public_shares {
+            for (id, share) in shares.shares {
+                dkg_public_shares.insert(id, DkgPublicShares::try_from(share)?);
+            }
+        }
+        Ok(DkgPrivateBegin {
             dkg_id: value.dkg_id,
             signer_ids: value.signer_ids,
             key_ids: value.key_ids,
-        }
+            dkg_public_shares,
+        })
     }
 }
 
@@ -720,17 +736,28 @@ impl From<DkgEndBegin> for proto::DkgEndBegin {
             dkg_id: value.dkg_id,
             signer_ids: value.signer_ids,
             key_ids: value.key_ids,
+            dkg_private_shares: value
+                .dkg_private_shares
+                .iter()
+                .map(|(i, s)| (*i, proto::DkgPrivateShares::from(s.clone())))
+                .collect(),
         }
     }
 }
 
-impl From<proto::DkgEndBegin> for DkgEndBegin {
-    fn from(value: proto::DkgEndBegin) -> Self {
-        DkgEndBegin {
+impl TryFrom<proto::DkgEndBegin> for DkgEndBegin {
+    type Error = Error;
+    fn try_from(value: proto::DkgEndBegin) -> Result<Self, Self::Error> {
+        let mut dkg_private_shares = HashMap::new();
+        for (id, shares) in value.dkg_private_shares {
+            dkg_private_shares.insert(id, DkgPrivateShares::try_from(shares.clone())?);
+        }
+        Ok(DkgEndBegin {
             dkg_id: value.dkg_id,
             signer_ids: value.signer_ids,
             key_ids: value.key_ids,
-        }
+            dkg_private_shares,
+        })
     }
 }
 
@@ -1131,13 +1158,13 @@ impl TryFrom<proto::WstsMessage> for WstsMessage {
                 wsts::net::Message::DkgPublicShares(inner.try_into()?)
             }
             proto::wsts_message::Inner::DkgPrivateBegin(inner) => {
-                wsts::net::Message::DkgPrivateBegin(inner.into())
+                wsts::net::Message::DkgPrivateBegin(inner.try_into()?)
             }
             proto::wsts_message::Inner::DkgPrivateShares(inner) => {
                 wsts::net::Message::DkgPrivateShares(inner.try_into()?)
             }
             proto::wsts_message::Inner::DkgEndBegin(inner) => {
-                wsts::net::Message::DkgEndBegin(inner.into())
+                wsts::net::Message::DkgEndBegin(inner.try_into()?)
             }
             proto::wsts_message::Inner::DkgEnd(inner) => {
                 wsts::net::Message::DkgEnd(inner.try_into()?)
@@ -1933,11 +1960,12 @@ mod tests {
         }
     }
     impl Dummy<Unit> for DkgPrivateBegin {
-        fn dummy_with_rng<R: rand::Rng + ?Sized>(_: &Unit, rng: &mut R) -> Self {
+        fn dummy_with_rng<R: rand::Rng + ?Sized>(config: &Unit, rng: &mut R) -> Self {
             DkgPrivateBegin {
                 dkg_id: Faker.fake_with_rng(rng),
                 signer_ids: Faker.fake_with_rng(rng),
                 key_ids: Faker.fake_with_rng(rng),
+                dkg_public_shares: config.fake_with_rng(rng),
             }
         }
     }
@@ -1962,11 +1990,12 @@ mod tests {
     }
 
     impl Dummy<Unit> for DkgEndBegin {
-        fn dummy_with_rng<R: rand::Rng + ?Sized>(_: &Unit, rng: &mut R) -> Self {
+        fn dummy_with_rng<R: rand::Rng + ?Sized>(config: &Unit, rng: &mut R) -> Self {
             DkgEndBegin {
                 dkg_id: Faker.fake_with_rng(rng),
                 signer_ids: Faker.fake_with_rng(rng),
                 key_ids: Faker.fake_with_rng(rng),
+                dkg_private_shares: config.fake_with_rng(rng),
             }
         }
     }
@@ -2209,6 +2238,24 @@ mod tests {
     }
 
     impl Dummy<Unit> for BTreeMap<u32, DkgPublicShares> {
+        fn dummy_with_rng<R: rand::Rng + ?Sized>(config: &Unit, rng: &mut R) -> Self {
+            fake::vec![(); 0..20]
+                .into_iter()
+                .map(|_| (Faker.fake_with_rng(rng), config.fake_with_rng(rng)))
+                .collect()
+        }
+    }
+
+    impl Dummy<Unit> for hashbrown::HashMap<u32, DkgPublicShares> {
+        fn dummy_with_rng<R: rand::Rng + ?Sized>(config: &Unit, rng: &mut R) -> Self {
+            fake::vec![(); 0..20]
+                .into_iter()
+                .map(|_| (Faker.fake_with_rng(rng), config.fake_with_rng(rng)))
+                .collect()
+        }
+    }
+
+    impl Dummy<Unit> for hashbrown::HashMap<u32, DkgPrivateShares> {
         fn dummy_with_rng<R: rand::Rng + ?Sized>(config: &Unit, rng: &mut R) -> Self {
             fake::vec![(); 0..20]
                 .into_iter()
