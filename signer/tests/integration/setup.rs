@@ -26,7 +26,7 @@ use signer::bitcoin::utxo::SbtcRequests;
 use signer::bitcoin::utxo::SignerBtcState;
 use signer::bitcoin::utxo::SignerUtxo;
 use signer::bitcoin::utxo::TxDeconstructor as _;
-use signer::block_observer::BlockObserver;
+use signer::block_observer;
 use signer::block_observer::Deposit;
 use signer::config::Settings;
 use signer::context::SbtcLimits;
@@ -712,16 +712,15 @@ impl TestSweepSetup2 {
             .get_tx(&self.donation.txid)
             .unwrap()
             .unwrap();
-        let block_observer = BlockObserver {
-            context,
-            bitcoin_blocks: (),
-            horizon: 3,
-        };
 
-        block_observer
-            .extract_sbtc_transactions(block_hash.unwrap(), &[tx])
-            .await
-            .unwrap();
+        block_observer::extract_sbtc_transactions(
+            db,
+            &context.bitcoin_client,
+            block_hash.unwrap(),
+            &[tx],
+        )
+        .await
+        .unwrap();
     }
 
     /// This function generates a sweep transaction that sweeps in the

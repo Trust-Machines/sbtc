@@ -18,6 +18,10 @@ use signer::api::ApiState;
 use signer::bitcoin::rpc::BitcoinCoreClient;
 use signer::bitcoin::zmq::BitcoinCoreMessageStream;
 use signer::block_observer;
+use signer::blockchain_sync::determine_nakamoto_activation_height;
+use signer::blockchain_sync::sync_blockchains;
+use signer::blockchain_sync::wait_for_nakamoto_activation_height;
+use signer::blockchain_sync::wait_for_stacks_node_to_report_full_sync;
 use signer::blocklist_client::BlocklistClient;
 use signer::config::Settings;
 use signer::context::Context;
@@ -98,23 +102,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         context.state().current_signer_set().add_signer(signer);
     }
 
-    // Run the application components concurrently. We're `join!`ing them
-    // here so that every component can shut itself down gracefully when
-    // the shutdown signal is received.
+    // Spawn the signer's API. This is spawned here because it
+    // needs to be running before we start syncing the blockchains due to the
+    // way the Stacks event observer works, i.e. the Stacks node will not
+    // progress if it cannot send events to the observer and thus become out-
+    // of-sync.
+    let signer_api_handle = tokio::spawn(run_api(context.clone()));
+
+    // Pause until the Stacks node is fully-synced, otherwise we will not be
+    // able to properly back-fill blocks and the sBTC signer will generally just
+    // not work.
+    tracing::info!("waiting for stacks node to report full-sync");
+    wait_for_stacks_node_to_report_full_sync(&context).await?;
+    tracing::info!("stacks node reports that is is up-to-date");
+
+    // Determine the Nakamoto activation height.
+    tracing::info!("determining the nakamoto activation height");
+    let nakamoto_activation_height = determine_nakamoto_activation_height(&context).await?;
+    context
+        .state()
+        .set_nakamoto_activation_height(nakamoto_activation_height);
+    tracing::info!(%nakamoto_activation_height, "nakamoto activation height determined");
+
+    // Wait for the Stacks node to reach the Nakamoto activation height.
+    wait_for_nakamoto_activation_height(&context, nakamoto_activation_height).await?;
+
+    // Back-fill the Bitcoin and Stacks blockchains from the current Stacks tip
+    // until the Nakamoto activation height.
+    tracing::info!(
+        "preparing to backfill bitcoin & stacks blockchains to the nakamoto activation height"
+    );
+    sync_blockchains(&context, nakamoto_activation_height).await?;
+
+    // Run the application components concurrently. We're `join!`ing them here
+    // so that every component can shut itself down gracefully when the shutdown
+    // signal is received.
     //
     // Note that we must use `join` here instead of `select` as `select` would
     // immediately abort the remaining tasks on the first completion, which
     // deprives the other tasks of the opportunity to shut down gracefully. This
     // is the reason we also use the `run_checked` helper method, which will
-    // intercept errors and send a shutdown signal to the other components if an error
-    // does occur, otherwise the `join` will continue running indefinitely.
+    // intercept errors and send a shutdown signal to the other components if an
+    // error does occur, otherwise the `join` will continue running
+    // indefinitely.
     let _ = tokio::join!(
-        // Our global termination signal watcher. This does not run using `run_checked`
-        // as it sends its own shutdown signal.
+        // Our global termination signal watcher. This does not run using
+        // `run_checked` as it sends its own shutdown signal.
         run_shutdown_signal_watcher(context.clone()),
+        // Due to the way Stacks event observers work, we needed to spawn this
+        // prior to syncing the blockchains.
+        signer_api_handle,
         // The rest of our services which run concurrently, and must all be
         // running for the signer to be operational.
-        run_checked(run_api, &context),
         run_checked(run_libp2p_swarm, &context),
         run_checked(run_block_observer, &context),
         run_checked(run_request_decider, &context),
@@ -126,9 +165,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// A helper method that captures errors from the provided future and sends a
-/// shutdown signal to the application if an error is encountered. This is needed
-/// as otherwise the application would continue running indefinitely (since no
-/// shutdown signal is sent automatically on error).
+/// shutdown signal to the application if an error is encountered. This is
+/// needed as otherwise the application would continue running indefinitely
+/// (since no shutdown signal is sent automatically on error).
 async fn run_checked<F, Fut, C>(f: F, ctx: &C) -> Result<(), Error>
 where
     C: Context,

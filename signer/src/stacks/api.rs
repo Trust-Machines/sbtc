@@ -1004,28 +1004,26 @@ impl StacksClient {
 }
 
 /// Fetch all Nakamoto blocks that are not already stored in the
-/// datastore.
+/// datastore, walking backwards until the specified Bitcoin
+/// block height is reached.
 pub async fn fetch_unknown_ancestors<S, D>(
     stacks: &S,
     db: &D,
     block_id: StacksBlockId,
+    until_bitcoin_height: u64,
 ) -> Result<Vec<TenureBlocks>, Error>
 where
     S: StacksInteract,
     D: DbRead + Send + Sync,
 {
     let mut blocks = vec![stacks.get_tenure(block_id).await?];
-    let pox_info = stacks.get_pox_info().await?;
-    let nakamoto_start_height = pox_info
-        .nakamoto_start_height()
-        .ok_or(Error::MissingNakamotoStartHeight)?;
 
     while let Some(tenure) = blocks.last() {
         // We won't get anymore Nakamoto blocks before this point, so
         // time to stop.
-        if tenure.anchor_block_height <= nakamoto_start_height {
-            tracing::debug!(
-                %nakamoto_start_height,
+        if tenure.anchor_block_height <= until_bitcoin_height {
+            tracing::info!(
+                %until_bitcoin_height,
                 last_chain_length = %tenure.anchor_block_height,
                 "all Nakamoto blocks fetched; stopping"
             );
@@ -1443,30 +1441,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         SignerWallet::new(&public_keys, signatures_required, network_kind, 0).unwrap()
-    }
-
-    #[ignore = "This is an integration test that hasn't been setup for CI yet"]
-    #[test(tokio::test)]
-    async fn fetch_unknown_ancestors_works() {
-        let db_num = DATABASE_NUM.fetch_add(1, Ordering::SeqCst);
-        let db = crate::testing::storage::new_test_database(db_num, true).await;
-
-        let settings = Settings::new_from_default_config().unwrap();
-        // This is an integration test that will read from the config, which provides
-        // a list of endpoints, so we use the fallback client.
-        let client: ApiFallbackClient<StacksClient> = TryFrom::try_from(&settings).unwrap();
-
-        let info = client.get_tenure_info().await.unwrap();
-        let tenures = fetch_unknown_ancestors(&client, &db, info.tip_block_id).await;
-
-        let blocks = tenures.unwrap();
-        let headers = blocks
-            .iter()
-            .flat_map(TenureBlocks::as_stacks_blocks)
-            .collect::<Vec<_>>();
-        db.write_stacks_block_headers(headers).await.unwrap();
-
-        crate::testing::storage::drop_db(db).await;
     }
 
     /// Test that get_blocks works as expected.
@@ -2050,22 +2024,6 @@ mod tests {
         mock.assert();
     }
 
-    #[tokio::test]
-    #[ignore = "This is an integration test that hasn't been setup for CI yet"]
-    async fn fetching_last_tenure_blocks_works() {
-        let settings = Settings::new_from_default_config().unwrap();
-        // We use the fallback client here because the CI test reads from the config
-        // which provides a list of endpoints.
-        let client: ApiFallbackClient<StacksClient> = TryFrom::try_from(&settings).unwrap();
-        let storage = Store::new_shared();
-
-        let info = client.get_tenure_info().await.unwrap();
-        let blocks = fetch_unknown_ancestors(&client, &storage, info.tenure_start_block_id)
-            .await
-            .unwrap();
-        assert!(!blocks.is_empty());
-    }
-
     #[test_case("0x1A3B5C7D9E", 112665066910; "uppercase-112665066910")]
     #[test_case("0x1a3b5c7d9e", 112665066910; "lowercase-112665066910")]
     #[test_case("1a3b5c7d9e", 112665066910; "no-prefix-lowercase-112665066910")]
@@ -2094,5 +2052,45 @@ mod tests {
         let address = StacksAddress::burn_address(false);
         let account = client.get_account(&address).await.unwrap();
         assert_eq!(account.nonce, 0);
+    }
+
+    #[ignore = "This is an integration test that hasn't been setup for CI yet"]
+    #[test(tokio::test)]
+    async fn fetch_unknown_ancestors_works() {
+        let db_num = DATABASE_NUM.fetch_add(1, Ordering::SeqCst);
+        let db = crate::testing::storage::new_test_database(db_num, true).await;
+
+        let settings = Settings::new_from_default_config().unwrap();
+        // This is an integration test that will read from the config, which provides
+        // a list of endpoints, so we use the fallback client.
+        let client: ApiFallbackClient<StacksClient> = TryFrom::try_from(&settings).unwrap();
+
+        let info = client.get_tenure_info().await.unwrap();
+        let tenures = fetch_unknown_ancestors(&client, &db, info.tip_block_id, 20).await;
+
+        let blocks = tenures.unwrap();
+        let headers = blocks
+            .iter()
+            .flat_map(TenureBlocks::as_stacks_blocks)
+            .collect::<Vec<_>>();
+        db.write_stacks_block_headers(headers).await.unwrap();
+
+        crate::testing::storage::drop_db(db).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "This is an integration test that hasn't been setup for CI yet"]
+    async fn fetching_last_tenure_blocks_works() {
+        let settings = Settings::new_from_default_config().unwrap();
+        // We use the fallback client here because the CI test reads from the config
+        // which provides a list of endpoints.
+        let client: ApiFallbackClient<StacksClient> = TryFrom::try_from(&settings).unwrap();
+        let storage = Store::new_shared();
+
+        let info = client.get_tenure_info().await.unwrap();
+        let blocks = fetch_unknown_ancestors(&client, &storage, info.tenure_start_block_id, 31)
+            .await
+            .unwrap();
+        assert!(!blocks.is_empty());
     }
 }

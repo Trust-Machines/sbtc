@@ -26,8 +26,6 @@ CREATE TABLE sbtc_signer.stacks_blocks (
     bitcoin_anchor BYTEA NOT NULL,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
--- Index to serve queries filtering on `parent_hash`. This is commonly used when
--- "walking" the chain in recursive CTE's.
 
 CREATE TABLE sbtc_signer.deposit_requests (
     txid BYTEA NOT NULL,

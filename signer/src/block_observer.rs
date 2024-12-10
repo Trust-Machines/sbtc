@@ -39,6 +39,7 @@ use bitcoin::Amount;
 use bitcoin::BlockHash;
 use bitcoin::ScriptBuf;
 use bitcoin::Transaction;
+use clarity::types::chainstate::StacksAddress;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
 use sbtc::deposits::CreateDepositRequest;
@@ -276,20 +277,45 @@ impl<C: Context, B> BlockObserver<C, B> {
     /// Process the bitcoin block. Also process all recent stacks blocks.
     #[tracing::instrument(skip_all, fields(block_hash = %block.block_hash()))]
     async fn process_bitcoin_block(&self, block: bitcoin::Block) -> Result<(), Error> {
+        let storage = self.context.get_storage_mut();
+        let bitcoin_client = self.context.get_bitcoin_client();
+
         tracing::info!("processing bitcoin block");
+
+        let until_bitcoin_height = self.context.state().nakamoto_activation_height();
+
+        // Get the current tenure info (incl. tip details) from the Stacks node.
         let stacks_client = self.context.get_stacks_client();
         let tenure_info = stacks_client.get_tenure_info().await?;
 
+        // While we do do this at startup to do the "heavy lifting" of syncing
+        // potentially from a long chain, we also do this here to ensure that
+        // we don't miss any Stacks blocks given the high frequency of
+        // Nakamoto blocks.
+        //
+        // Maybe this can be removed in the future if we can be sure that our
+        // Stacks event observer will always pick up this information before
+        // we get here, but for now it's a good safety net.
         tracing::debug!("fetching unknown ancestral blocks from stacks-core");
         let stacks_blocks = crate::stacks::api::fetch_unknown_ancestors(
             &stacks_client,
-            &self.context.get_storage(),
+            &storage,
             tenure_info.tip_block_id,
+            until_bitcoin_height,
         )
         .await?;
 
-        self.write_stacks_blocks(&stacks_blocks).await?;
-        self.write_bitcoin_block(&block).await?;
+        // Write the Stacks blocks and header information. This method will also
+        // extract relevant sBTC information from the blocks.
+        write_stacks_blocks(
+            &storage,
+            &self.context.config().signer.deployer,
+            &stacks_blocks,
+        )
+        .await?;
+
+        // Finally, write the Bitcoin block and any sBTC-related transactions.
+        write_bitcoin_block(&storage, &bitcoin_client, &block).await?;
 
         tracing::debug!("finished processing bitcoin block");
         Ok(())
@@ -367,125 +393,6 @@ impl<C: Context, B> BlockObserver<C, B> {
         Ok(())
     }
 
-    /// Extract all BTC transactions from the block where one of the UTXOs
-    /// can be spent by the signers.
-    ///
-    /// # Note
-    ///
-    /// When using the postgres storage, we need to make sure that this
-    /// function is called after the `Self::write_bitcoin_block` function
-    /// because of the foreign key constraints.
-    pub async fn extract_sbtc_transactions(
-        &self,
-        block_hash: BlockHash,
-        txs: &[Transaction],
-    ) -> Result<(), Error> {
-        let db = self.context.get_storage_mut();
-        // We store all the scriptPubKeys associated with the signers'
-        // aggregate public key. Let's get the last years worth of them.
-        let signer_script_pubkeys: HashSet<ScriptBuf> = db
-            .get_signers_script_pubkeys()
-            .await?
-            .into_iter()
-            .map(ScriptBuf::from_bytes)
-            .collect();
-
-        let btc_rpc = self.context.get_bitcoin_client();
-        // Look through all the UTXOs in the given transaction slice and
-        // keep the transactions where a UTXO is locked with a
-        // `scriptPubKey` controlled by the signers.
-        let mut sbtc_txs = Vec::new();
-        for tx in txs {
-            tracing::debug!(txid = %tx.compute_txid(), "attempting to extract sbtc transaction");
-            // If any of the outputs are spent to one of the signers'
-            // addresses, then we care about it
-            let outputs_spent_to_signers = tx
-                .output
-                .iter()
-                .any(|tx_out| signer_script_pubkeys.contains(&tx_out.script_pubkey));
-
-            if !outputs_spent_to_signers {
-                continue;
-            }
-
-            // This function is called after we have received a
-            // notification of a bitcoin block, and we are iterating
-            // through all of the transactions within that block. This
-            // means the `get_tx_info` call below should not fail.
-            let txid = tx.compute_txid();
-            let tx_info = btc_rpc
-                .get_tx_info(&txid, &block_hash)
-                .await?
-                .ok_or(Error::BitcoinTxMissing(txid, None))?;
-
-            // sBTC transactions have as first txin a signers spendable output
-            let tx_type = if tx_info.is_signer_created(&signer_script_pubkeys) {
-                model::TransactionType::SbtcTransaction
-            } else {
-                model::TransactionType::Donation
-            };
-
-            let txid = tx.compute_txid();
-            sbtc_txs.push(model::Transaction {
-                txid: txid.to_byte_array(),
-                tx: bitcoin::consensus::serialize(&tx),
-                tx_type,
-                block_hash: block_hash.to_byte_array(),
-            });
-
-            for prevout in tx_info.to_inputs(&signer_script_pubkeys) {
-                db.write_tx_prevout(&prevout).await?;
-            }
-
-            for output in tx_info.to_outputs(&signer_script_pubkeys) {
-                db.write_tx_output(&output).await?;
-            }
-        }
-
-        // Write these transactions into storage.
-        db.write_bitcoin_transactions(sbtc_txs).await?;
-        Ok(())
-    }
-
-    /// Write the given stacks blocks to the database.
-    ///
-    /// This function also extracts sBTC Stacks transactions from the given
-    /// blocks and stores them into the database.
-    async fn write_stacks_blocks(&self, tenures: &[TenureBlocks]) -> Result<(), Error> {
-        let deployer = &self.context.config().signer.deployer;
-        let txs = tenures
-            .iter()
-            .flat_map(|tenure| {
-                storage::postgres::extract_relevant_transactions(tenure.blocks(), deployer)
-            })
-            .collect::<Vec<_>>();
-
-        let headers = tenures
-            .iter()
-            .flat_map(TenureBlocks::as_stacks_blocks)
-            .collect::<Vec<_>>();
-
-        let storage = self.context.get_storage_mut();
-        storage.write_stacks_block_headers(headers).await?;
-        storage.write_stacks_transactions(txs).await?;
-        Ok(())
-    }
-
-    /// Write the bitcoin block to the database. We also write any
-    /// transactions that are spend to any of the signers `scriptPubKey`s
-    async fn write_bitcoin_block(&self, block: &bitcoin::Block) -> Result<(), Error> {
-        let db_block = model::BitcoinBlock::from(block);
-
-        self.context
-            .get_storage_mut()
-            .write_bitcoin_block(&db_block)
-            .await?;
-        self.extract_sbtc_transactions(block.block_hash(), &block.txdata)
-            .await?;
-
-        Ok(())
-    }
-
     /// Update the sBTC peg limits from Emily
     async fn update_sbtc_limits(&self) -> Result<(), Error> {
         let limits = self.context.get_emily_client().get_limits().await?;
@@ -523,6 +430,125 @@ impl<C: Context, B> BlockObserver<C, B> {
         }
         Ok(())
     }
+}
+
+/// Takes a list of Nakamoto [`TenureBlocks`] and writes the Stacks block
+/// headers and transactions to the database.
+pub async fn write_stacks_blocks(
+    storage: &impl DbWrite,
+    deployer: &StacksAddress,
+    tenures: &[TenureBlocks],
+) -> Result<(), Error> {
+    let txs = tenures
+        .iter()
+        .flat_map(|tenure| {
+            storage::postgres::extract_relevant_transactions(tenure.blocks(), deployer)
+        })
+        .collect::<Vec<_>>();
+
+    let headers = tenures
+        .iter()
+        .flat_map(TenureBlocks::as_stacks_blocks)
+        .collect::<Vec<_>>();
+
+    storage.write_stacks_block_headers(headers).await?;
+    storage.write_stacks_transactions(txs).await?;
+    Ok(())
+}
+
+/// Write the bitcoin block to the database. We also write any
+/// transactions that are spend to any of the signers `scriptPubKey`s
+pub async fn write_bitcoin_block(
+    storage: &(impl DbRead + DbWrite),
+    bitcoin_client: &impl BitcoinInteract,
+    block: &bitcoin::Block,
+) -> Result<(), Error> {
+    let db_block = model::BitcoinBlock::from(block);
+
+    storage.write_bitcoin_block(&db_block).await?;
+
+    extract_sbtc_transactions(storage, bitcoin_client, block.block_hash(), &block.txdata).await?;
+
+    Ok(())
+}
+
+/// Extract all BTC transactions from the block where one of the UTXOs
+/// can be spent by the signers.
+///
+/// # Note
+///
+/// When using the postgres storage, we need to make sure that this
+/// function is called after the `Self::write_bitcoin_block` function
+/// because of the foreign key constraints.
+pub async fn extract_sbtc_transactions(
+    storage: &(impl DbWrite + DbRead),
+    bitcoin_client: &impl BitcoinInteract,
+    block_hash: BlockHash,
+    txs: &[Transaction],
+) -> Result<(), Error> {
+    // We store all the scriptPubKeys associated with the signers'
+    // aggregate public key. Let's get the last years worth of them.
+    let signer_script_pubkeys: HashSet<ScriptBuf> = storage
+        .get_signers_script_pubkeys()
+        .await?
+        .into_iter()
+        .map(ScriptBuf::from_bytes)
+        .collect();
+
+    // Look through all the UTXOs in the given transaction slice and
+    // keep the transactions where a UTXO is locked with a
+    // `scriptPubKey` controlled by the signers.
+    let mut sbtc_txs = Vec::new();
+    for tx in txs {
+        tracing::debug!(txid = %tx.compute_txid(), "attempting to extract sbtc transaction");
+        // If any of the outputs are spent to one of the signers'
+        // addresses, then we care about it
+        let outputs_spent_to_signers = tx
+            .output
+            .iter()
+            .any(|tx_out| signer_script_pubkeys.contains(&tx_out.script_pubkey));
+
+        if !outputs_spent_to_signers {
+            continue;
+        }
+
+        // This function is called after we have received a
+        // notification of a bitcoin block, and we are iterating
+        // through all of the transactions within that block. This
+        // means the `get_tx_info` call below should not fail.
+        let txid = tx.compute_txid();
+        let tx_info = bitcoin_client
+            .get_tx_info(&txid, &block_hash)
+            .await?
+            .ok_or(Error::BitcoinTxMissing(txid, None))?;
+
+        // sBTC transactions have as first txin a signers spendable output
+        let tx_type = if tx_info.is_signer_created(&signer_script_pubkeys) {
+            model::TransactionType::SbtcTransaction
+        } else {
+            model::TransactionType::Donation
+        };
+
+        let txid = tx.compute_txid();
+        sbtc_txs.push(model::Transaction {
+            txid: txid.to_byte_array(),
+            tx: bitcoin::consensus::serialize(&tx),
+            tx_type,
+            block_hash: block_hash.to_byte_array(),
+        });
+
+        for prevout in tx_info.to_inputs(&signer_script_pubkeys) {
+            storage.write_tx_prevout(&prevout).await?;
+        }
+
+        for output in tx_info.to_outputs(&signer_script_pubkeys) {
+            storage.write_tx_output(&output).await?;
+        }
+    }
+
+    // Write these transactions into storage.
+    storage.write_bitcoin_transactions(sbtc_txs).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -875,24 +901,10 @@ mod tests {
         test_harness.add_deposit(txid0, response0);
         test_harness.add_deposit(txid1, response1);
 
-        let ctx = TestContext::builder()
-            .with_storage(storage.clone())
-            .with_stacks_client(test_harness.clone())
-            .with_emily_client(test_harness.clone())
-            .with_bitcoin_client(test_harness.clone())
-            .build();
-
-        let block_observer = BlockObserver {
-            context: ctx,
-            bitcoin_blocks: (),
-            horizon: 1,
-        };
-
         // First we try extracting the transactions from a block that does
         // not contain any transactions spent to the signers
         let txs = [tx_setup1.tx.clone()];
-        block_observer
-            .extract_sbtc_transactions(block_hash, &txs)
+        extract_sbtc_transactions(&storage, &test_harness, block_hash, &txs)
             .await
             .unwrap();
 
@@ -911,8 +923,7 @@ mod tests {
         // Now we try again, but we include the transaction that spends to
         // the signer. This one should turn out differently.
         let txs = [tx_setup0.tx.clone(), tx_setup1.tx.clone()];
-        block_observer
-            .extract_sbtc_transactions(block_hash, &txs)
+        extract_sbtc_transactions(&storage, &test_harness, block_hash, &txs)
             .await
             .unwrap();
 
