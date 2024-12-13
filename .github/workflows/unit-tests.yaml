@@ -53,6 +53,11 @@ jobs:
         if: always()
         run: make integration-env-down-ci
 
+      - name: Setup upterm session
+        uses: lhotari/action-upterm@v1
+        with:
+          limit-access-to-actor: true
+
       - name: Upload integration test logs
         uses: actions/upload-artifact@v4
         if: always()
